@@ -1,0 +1,24 @@
+# Android / Gradle
+.gradle/
+.kotlin/
+build/
+app/build/
+local.properties
+*.apk
+*.aab
+
+# ESP32 / local build outputs
+.build/
+*.elf
+*.map
+*.bin
+
+# Linker lab generated outputs
+research/linker-lab/build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
