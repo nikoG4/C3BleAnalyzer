@@ -1,0 +1,33 @@
+name: Reconstruct firmware source
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "firmware/C3BleAnalyzer.ino.gz"
+
+permissions:
+  contents: write
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct canonical INO
+        run: gzip -dc firmware/C3BleAnalyzer.ino.gz > firmware/C3BleAnalyzer.ino
+
+      - name: Commit reconstructed source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware/C3BleAnalyzer.ino
+          if git diff --cached --quiet; then
+            echo "Firmware source already up to date"
+            exit 0
+          fi
+          git commit -m "feat: add canonical ESP32-C3 firmware source"
+          git push
