@@ -1,0 +1,30 @@
+name: Build ESP32-C3 LAB firmware
+
+on:
+  push:
+    branches:
+      - lab/c3-authorized-raw-tx
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install Arduino-ESP32 3.3.0
+        shell: pwsh
+        run: |
+          $index = "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+          arduino-cli core update-index --additional-urls $index
+          arduino-cli core install esp32:esp32@3.3.0 --additional-urls $index
+      - name: Compile LAB variant
+        shell: pwsh
+        run: .\firmware\build-lab.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c3bleanalyzer-lab-firmware
+          path: |
+            .build/lab-firmware/*.bin
+            .build/lab-firmware/*.elf
+          if-no-files-found: error
