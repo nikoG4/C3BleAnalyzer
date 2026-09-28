@@ -161,6 +161,14 @@ uint8_t labVerifiedBssid[6] = {};
 uint32_t labVerifyDeadline = 0;
 volatile bool labRevokeOnBleDisconnect = false;
 
+// Conteos de diagnóstico RX; se leen por USB fuera del callback Wi-Fi.
+volatile uint32_t rxDiagData = 0;
+volatile uint32_t rxDiagSelected = 0;
+volatile uint32_t rxDiagSnap = 0;
+volatile uint32_t rxDiagEapolType = 0;
+volatile uint32_t rxDiagAssoc = 0;
+volatile uint32_t rxDiagBadState = 0;
+
 // El callback BLE solo copia el comando. Se procesa luego en loop().
 char pendingCommand[MAX_COMMAND_LEN + 1] = {};
 volatile bool commandPending = false;
@@ -413,6 +421,12 @@ void resetMonitorStats() {
   apContextSubtype = 0;
   pcapMgmtContextCount = 0;
   pcapOverflow = false;
+  rxDiagData = 0;
+  rxDiagSelected = 0;
+  rxDiagSnap = 0;
+  rxDiagEapolType = 0;
+  rxDiagAssoc = 0;
+  rxDiagBadState = 0;
   portEXIT_CRITICAL(&monitorMux);
 }
 
@@ -522,7 +536,10 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   const int len = packet->rx_ctrl.sig_len;
 
   if (frame == nullptr || len < 28) return;
-  if (packet->rx_ctrl.rx_state != 0) return;
+  if (packet->rx_ctrl.rx_state != 0) {
+    ++rxDiagBadState;
+    return;
+  }
 
   const uint16_t fc = frame[0] | (static_cast<uint16_t>(frame[1]) << 8);
   const uint8_t frameType = (fc >> 2) & 0x03;
@@ -557,6 +574,7 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 
     if (isUsefulAssociationManagementSubtype(subtype)) {
+      ++rxDiagAssoc;
       portENTER_CRITICAL(&monitorMux);
       // Limita el ruido y deja amplio espacio para EAPOL y el Beacon.
       if (pcapMgmtContextCount < 8 && pcapPacketCount < (MAX_PCAP_PACKETS - 8)) {
@@ -573,6 +591,7 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
 
   // Desde aquí solo Data frames.
   if (type != WIFI_PKT_DATA || frameType != 2) return;
+  ++rxDiagData;
 
   const bool toDS   = (fc & 0x0100) != 0;
   const bool fromDS = (fc & 0x0200) != 0;
@@ -601,6 +620,7 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // Filtrarlas antes de tocar cualquiera de las tablas evita que
   // FF:FF:FF:FF:FF:FF (u otra dirección de grupo) aparezca en la UI.
   if (isBroadcastMac(clientMac) || isMulticastMac(clientMac)) return;
+  ++rxDiagSelected;
 
   // Registra clientes vistos intercambiando Data con el AP seleccionado,
   // aunque todavía no haya aparecido un EAPOL. Esto permite que el modo LAB
@@ -620,10 +640,10 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (len < headerLength + 8 + 17 + 4) return;
 
   const uint8_t* llc = frame + headerLength;
-  if (
-    llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 ||
-    llc[6] != 0x88 || llc[7] != 0x8E
-  ) return;
+  if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) return;
+  ++rxDiagSnap;
+  if (llc[6] != 0x88 || llc[7] != 0x8E) return;
+  ++rxDiagEapolType;
 
   const uint8_t* eapol = llc + 8;
   const int available = (len - 4) - headerLength - 8;
@@ -1613,6 +1633,7 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t lastRxDiagMs = 0;
   // Reinicia advertising fuera del callback del stack BLE. Esto evita hacer
   // trabajo adicional dentro de onDisconnect() y hace la recuperación más
   // consistente en Arduino-ESP32 3.x.
@@ -1636,6 +1657,17 @@ void loop() {
 
   processPendingCommand();
   processSerialLabCommand();
+
+  if (monitorRunning && millis() - lastRxDiagMs >= 5000) {
+    lastRxDiagMs = millis();
+    Serial.printf("[RX] data=%lu selected=%lu snap=%lu eapol_type=%lu assoc=%lu bad_state=%lu\\n",
+                  static_cast<unsigned long>(rxDiagData),
+                  static_cast<unsigned long>(rxDiagSelected),
+                  static_cast<unsigned long>(rxDiagSnap),
+                  static_cast<unsigned long>(rxDiagEapolType),
+                  static_cast<unsigned long>(rxDiagAssoc),
+                  static_cast<unsigned long>(rxDiagBadState));
+  }
 
   if (monitorRunning && bleConnected && !pcapExportInProgress) {
     static uint32_t lastStatusMs = 0;
