@@ -1660,7 +1660,7 @@ void loop() {
 
   if (monitorRunning && millis() - lastRxDiagMs >= 5000) {
     lastRxDiagMs = millis();
-    Serial.printf("[RX] data=%lu selected=%lu snap=%lu eapol_type=%lu assoc=%lu bad_state=%lu\\n",
+    Serial.printf("[RX] data=%lu selected=%lu snap=%lu eapol_type=%lu assoc=%lu bad_state=%lu\n",
                   static_cast<unsigned long>(rxDiagData),
                   static_cast<unsigned long>(rxDiagSelected),
                   static_cast<unsigned long>(rxDiagSnap),
