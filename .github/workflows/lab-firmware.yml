@@ -10,6 +10,9 @@ concurrency:
   group: lab-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -25,3 +28,12 @@ jobs:
       - name: Compile LAB variant
         shell: pwsh
         run: .\firmware\build-lab.ps1
+      - name: Attach private LAB test binary to draft branch
+        shell: pwsh
+        run: |
+          Copy-Item .build/lab-firmware/C3BleAnalyzer.ino.bin firmware/C3BleAnalyzer.lab.bin -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f firmware/C3BleAnalyzer.lab.bin
+          git commit -m "Attach LAB test binary [skip ci]"
+          git push origin HEAD:lab/c3-authorized-raw-tx
