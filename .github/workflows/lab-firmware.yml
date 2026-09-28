@@ -6,6 +6,10 @@ on:
       - lab/c3-authorized-raw-tx
   workflow_dispatch:
 
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
