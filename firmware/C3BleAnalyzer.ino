@@ -3,14 +3,6 @@
 #include <esp_wifi.h>
 #include <esp_err.h>
 
-// Solo la compilación LAB explícita sustituye la validación de tramas del SDK.
-// La compilación normal de Arduino conserva el driver original.
-#if defined(LAB_ENABLE_RAW_TX)
-extern "C" __attribute__((used)) int ieee80211_raw_frame_sanity_check(
-    int32_t, int32_t, int32_t) {
-  return 0;
-}
-#endif
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
