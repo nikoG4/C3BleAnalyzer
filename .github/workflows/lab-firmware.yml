@@ -25,10 +25,3 @@ jobs:
       - name: Compile LAB variant
         shell: pwsh
         run: .\firmware\build-lab.ps1
-      - uses: actions/upload-artifact@v4
-        with:
-          name: c3bleanalyzer-lab-firmware
-          path: |
-            .build/lab-firmware/*.bin
-            .build/lab-firmware/*.elf
-          if-no-files-found: error
