@@ -30,6 +30,7 @@ if (-not $OutputDir) {
 $sketchDir = Join-Path $repoRoot ".build\lab-sketch\C3BleAnalyzer"
 New-Item -ItemType Directory -Path $sketchDir, $OutputDir -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "C3BleAnalyzer.ino") -Destination (Join-Path $sketchDir "C3BleAnalyzer.ino") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "lab_raw_tx.cpp") -Destination (Join-Path $sketchDir "lab_raw_tx.cpp") -Force
 
 # El simbolo sustituto solo se compila aqui. Arduino IDE conserva el build normal.
 & arduino-cli compile --fqbn esp32:esp32:esp32c3 --warnings all `
