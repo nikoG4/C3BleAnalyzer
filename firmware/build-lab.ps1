@@ -33,7 +33,8 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "C3BleAnalyzer.ino") -Destinatio
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "lab_raw_tx.cpp") -Destination (Join-Path $sketchDir "lab_raw_tx.cpp") -Force
 
 # El simbolo sustituto solo se compila aqui. Arduino IDE conserva el build normal.
-& arduino-cli compile --fqbn esp32:esp32:esp32c3 --warnings all `
+# COM por USB nativo del C3: Serial debe usar USB CDC, no UART0.
+& arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc --warnings all `
     --output-dir $OutputDir `
     --build-property "compiler.cpp.extra_flags=-DLAB_ENABLE_RAW_TX" `
     --build-property "compiler.c.elf.extra_flags=-Wl,--allow-multiple-definition" `
