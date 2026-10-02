@@ -1,0 +1,39 @@
+name: Build ESP32-C3 LAB firmware
+
+on:
+  push:
+    branches:
+      - lab/c3-authorized-raw-tx
+  workflow_dispatch:
+
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install Arduino-ESP32 3.3.0
+        shell: pwsh
+        run: |
+          $index = "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+          arduino-cli core update-index --additional-urls $index
+          arduino-cli core install esp32:esp32@3.3.0 --additional-urls $index
+      - name: Compile LAB variant
+        shell: pwsh
+        run: .\firmware\build-lab.ps1
+      - name: Attach private LAB test binary to draft branch
+        shell: pwsh
+        run: |
+          Copy-Item .build/lab-firmware/C3BleAnalyzer.ino.bin firmware/C3BleAnalyzer.lab.bin -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f firmware/C3BleAnalyzer.lab.bin
+          git commit -m "Attach LAB test binary [skip ci]"
+          git push origin HEAD:lab/c3-authorized-raw-tx

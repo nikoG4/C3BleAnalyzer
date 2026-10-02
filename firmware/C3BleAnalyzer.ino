@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_err.h>
+
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -56,6 +57,8 @@ constexpr size_t PCAP_CHUNK_RAW = 96;
 // ---------------- LAB: reconexión controlada ----------------
 constexpr uint32_t LAB_ARM_WINDOW_MS = 30000;   // 30 s para ejecutar una prueba
 constexpr uint32_t LAB_DEAUTH_COOLDOWN_MS = 10000; // mínimo 10 s entre intentos
+constexpr uint32_t LAB_AUTH_WINDOW_MS = 120000; // autorización local para una prueba
+constexpr uint32_t LAB_CONNECT_TIMEOUT_MS = 12000;
 
 // ============================================================
 // MODELOS
@@ -153,6 +156,18 @@ volatile bool pcapExportInProgress = false;
 bool labDeauthArmed = false;
 uint32_t labDeauthArmDeadline = 0;
 uint32_t lastLabDeauthMs = 0;
+bool labNetworkVerified = false;
+uint8_t labVerifiedBssid[6] = {};
+uint32_t labVerifyDeadline = 0;
+volatile bool labRevokeOnBleDisconnect = false;
+
+// Conteos de diagnóstico RX; se leen por USB fuera del callback Wi-Fi.
+volatile uint32_t rxDiagData = 0;
+volatile uint32_t rxDiagSelected = 0;
+volatile uint32_t rxDiagSnap = 0;
+volatile uint32_t rxDiagEapolType = 0;
+volatile uint32_t rxDiagAssoc = 0;
+volatile uint32_t rxDiagBadState = 0;
 
 // El callback BLE solo copia el comando. Se procesa luego en loop().
 char pendingCommand[MAX_COMMAND_LEN + 1] = {};
@@ -160,6 +175,28 @@ volatile bool commandPending = false;
 
 portMUX_TYPE monitorMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE commandMux = portMUX_INITIALIZER_UNLOCKED;
+
+void clearLabAuthorization() {
+  labNetworkVerified = false;
+  labDeauthArmed = false;
+  labVerifyDeadline = 0;
+  memset(labVerifiedBssid, 0, sizeof(labVerifiedBssid));
+}
+
+bool labAuthorizationValid() {
+  if (!labNetworkVerified || !hasSelectedNetwork || !monitorRunning ||
+      memcmp(labVerifiedBssid, selectedNetwork.bssidBytes, 6) != 0 ||
+      static_cast<int32_t>(millis() - labVerifyDeadline) >= 0) {
+    clearLabAuthorization();
+    return false;
+  }
+  return true;
+}
+
+void wipeSecret(char* data, size_t length) {
+  volatile char* p = data;
+  while (length-- > 0) *p++ = 0;
+}
 
 // ============================================================
 // UTILIDADES
@@ -384,6 +421,12 @@ void resetMonitorStats() {
   apContextSubtype = 0;
   pcapMgmtContextCount = 0;
   pcapOverflow = false;
+  rxDiagData = 0;
+  rxDiagSelected = 0;
+  rxDiagSnap = 0;
+  rxDiagEapolType = 0;
+  rxDiagAssoc = 0;
+  rxDiagBadState = 0;
   portEXIT_CRITICAL(&monitorMux);
 }
 
@@ -493,7 +536,10 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   const int len = packet->rx_ctrl.sig_len;
 
   if (frame == nullptr || len < 28) return;
-  if (packet->rx_ctrl.rx_state != 0) return;
+  if (packet->rx_ctrl.rx_state != 0) {
+    ++rxDiagBadState;
+    return;
+  }
 
   const uint16_t fc = frame[0] | (static_cast<uint16_t>(frame[1]) << 8);
   const uint8_t frameType = (fc >> 2) & 0x03;
@@ -528,6 +574,7 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 
     if (isUsefulAssociationManagementSubtype(subtype)) {
+      ++rxDiagAssoc;
       portENTER_CRITICAL(&monitorMux);
       // Limita el ruido y deja amplio espacio para EAPOL y el Beacon.
       if (pcapMgmtContextCount < 8 && pcapPacketCount < (MAX_PCAP_PACKETS - 8)) {
@@ -544,6 +591,7 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
 
   // Desde aquí solo Data frames.
   if (type != WIFI_PKT_DATA || frameType != 2) return;
+  ++rxDiagData;
 
   const bool toDS   = (fc & 0x0100) != 0;
   const bool fromDS = (fc & 0x0200) != 0;
@@ -572,6 +620,7 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // Filtrarlas antes de tocar cualquiera de las tablas evita que
   // FF:FF:FF:FF:FF:FF (u otra dirección de grupo) aparezca en la UI.
   if (isBroadcastMac(clientMac) || isMulticastMac(clientMac)) return;
+  ++rxDiagSelected;
 
   // Registra clientes vistos intercambiando Data con el AP seleccionado,
   // aunque todavía no haya aparecido un EAPOL. Esto permite que el modo LAB
@@ -591,10 +640,10 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (len < headerLength + 8 + 17 + 4) return;
 
   const uint8_t* llc = frame + headerLength;
-  if (
-    llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 ||
-    llc[6] != 0x88 || llc[7] != 0x8E
-  ) return;
+  if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) return;
+  ++rxDiagSnap;
+  if (llc[6] != 0x88 || llc[7] != 0x8E) return;
+  ++rxDiagEapolType;
 
   const uint8_t* eapol = llc + 8;
   const int available = (len - 4) - headerLength - 8;
@@ -666,7 +715,7 @@ void wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
 // ============================================================
 
 void stopMonitor() {
-  labDeauthArmed = false;
+  clearLabAuthorization();
   const bool wasRunning = monitorRunning;
   monitorRunning = false;
 
@@ -679,7 +728,7 @@ void stopMonitor() {
 }
 
 void startMonitor() {
-  labDeauthArmed = false;
+  clearLabAuthorization();
   if (!hasSelectedNetwork) {
     sendError("Selecciona una red primero");
     return;
@@ -927,6 +976,7 @@ void sortNetworksByRssi() {
 }
 
 void scanWifi() {
+  clearLabAuthorization();
   if (monitorRunning) {
     monitorRunning = false;
     esp_wifi_set_promiscuous(false);
@@ -1008,7 +1058,7 @@ void selectByBssid(const String& bssid) {
     if (networks[i].bssid.equalsIgnoreCase(bssid)) {
       selectedNetwork = networks[i];
       hasSelectedNetwork = true;
-      labDeauthArmed = false;
+      clearLabAuthorization();
       // Una selección nueva no debe conservar un PCAP de la red anterior.
       resetMonitorStats();
 
@@ -1055,7 +1105,8 @@ bool observedClientSnapshot(const uint8_t* mac, ObservedClient& snapshot) {
 }
 
 void sendLabStatus() {
-  const bool armed = labArmStillValid();
+  const bool verified = labAuthorizationValid();
+  const bool armed = verified && labArmStillValid();
   uint32_t ttl = 0;
   if (armed) ttl = labDeauthArmDeadline - millis();
 
@@ -1073,6 +1124,10 @@ void sendLabStatus() {
   j += String(ttl);
   j += ",\"cooldown_ms\":";
   j += String(cooldown);
+  j += ",\"verified\":";
+  j += verified ? "1" : "0";
+  j += ",\"verify_ttl_ms\":";
+  j += String(verified ? labVerifyDeadline - millis() : 0);
   j += ",\"mode\":\"unicast-only\"}";
   notifyEvent(j);
 }
@@ -1101,7 +1156,102 @@ void sendObservedLabClients() {
   notifyEvent("{\"t\":\"lab_clients_end\"}");
 }
 
+// La contraseña solo entra por USB Serial; nunca por BLE, PCAP, NVS ni logs.
+void verifyLabPassword(char* password) {
+#if !defined(LAB_ENABLE_RAW_TX)
+  sendError("LAB activo no está compilado; usa la compilación experimental");
+  return;
+#endif
+  if (!bleConnected) {
+    Serial.println("[LAB] conecta primero la app por BLE");
+    return;
+  }
+  if (!hasSelectedNetwork || selectedNetwork.ssid == "[Hidden]" ||
+      selectedNetwork.auth == WIFI_AUTH_OPEN || password[0] == '\0') {
+    sendError("Selecciona un AP WPA con SSID visible e introduce su clave por USB");
+    return;
+  }
+
+  clearLabAuthorization();
+  stopMonitor();
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(selectedNetwork.ssid.c_str(), password,
+             selectedNetwork.channel, selectedNetwork.bssidBytes, true);
+
+  const uint32_t deadline = millis() + LAB_CONNECT_TIMEOUT_MS;
+  while (WiFi.status() != WL_CONNECTED &&
+         static_cast<int32_t>(millis() - deadline) < 0) {
+    delay(50);
+  }
+  const uint8_t* connectedBssid = WiFi.BSSID();
+  const bool verified = WiFi.status() == WL_CONNECTED &&
+      connectedBssid != nullptr &&
+      memcmp(connectedBssid, selectedNetwork.bssidBytes, 6) == 0;
+
+  // No guardar la PSK en NVS ni dejar la conexión o su configuración activa.
+  WiFi.disconnect(false, true);
+  delay(50);
+  if (!verified) {
+    sendError("No se verificó la conexión al BSSID seleccionado");
+    return;
+  }
+
+  startMonitor();
+  if (!monitorRunning) {
+    sendError("Conexión verificada, pero no se pudo reiniciar el monitor");
+    return;
+  }
+  memcpy(labVerifiedBssid, selectedNetwork.bssidBytes, 6);
+  labVerifyDeadline = millis() + LAB_AUTH_WINDOW_MS;
+  labNetworkVerified = true;
+  Serial.printf("[LAB] acceso WPA verificado para %s; ventana 120 s\n",
+                selectedNetwork.bssid.c_str());
+  sendLabStatus();
+}
+
+void processSerialLabCommand() {
+  static char line[80] = {};
+  static size_t used = 0;
+  static bool discarding = false;
+  while (Serial.available() > 0) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r' || c == '\n') {
+      if (!discarding && used > 0) {
+        line[used] = '\0';
+        if (strncmp(line, "LAB_VERIFY|", 11) == 0) {
+          verifyLabPassword(line + 11);
+        } else {
+          Serial.println("[LAB] comando USB desconocido");
+        }
+      }
+      wipeSecret(line, sizeof(line));
+      used = 0;
+      discarding = false;
+      continue;
+    }
+    if (discarding) continue;
+    if (used + 1 >= sizeof(line)) {
+      wipeSecret(line, sizeof(line));
+      used = 0;
+      discarding = true;
+      Serial.println("[LAB] comando USB demasiado largo");
+      continue;
+    }
+    line[used++] = c;
+  }
+}
+
 void armLabDeauth(const String& token) {
+#if !defined(LAB_ENABLE_RAW_TX)
+  sendError("LAB activo no está compilado");
+  return;
+#endif
+  if (!labAuthorizationValid()) {
+    sendError("Verifica primero el acceso al AP por USB (LAB_VERIFY|clave)");
+    sendLabStatus();
+    return;
+  }
   if (!hasSelectedNetwork || !monitorRunning) {
     sendError("LAB requiere red seleccionada y monitor activo");
     return;
@@ -1126,6 +1276,14 @@ void disarmLabDeauth() {
 }
 
 void labDeauthUnicast(const String& macText) {
+#if !defined(LAB_ENABLE_RAW_TX)
+  sendError("LAB activo no está compilado");
+  return;
+#endif
+  if (!labAuthorizationValid()) {
+    sendError("Autorización WPA ausente o vencida");
+    return;
+  }
   if (!hasSelectedNetwork || !monitorRunning) {
     sendError("LAB requiere red seleccionada y monitor activo");
     return;
@@ -1139,7 +1297,7 @@ void labDeauthUnicast(const String& macText) {
 
   // Consumimos el armado aunque la transmisión falle: cada intento requiere
   // una confirmación nueva desde Android.
-  labDeauthArmed = false;
+  clearLabAuthorization();
 
   const uint32_t now = millis();
   if (lastLabDeauthMs != 0 && (now - lastLabDeauthMs) < LAB_DEAUTH_COOLDOWN_MS) {
@@ -1251,6 +1409,7 @@ public:
     // No tocamos el monitor Wi-Fi ni el PCAP. Solo se perdió el canal de
     // control. El advertising se reinicia desde loop() fuera del callback BLE.
     bleConnected = false;
+    labRevokeOnBleDisconnect = true;
     bleDisconnectedAt = millis();
     bleAdvertisingRestartPending = true;
     Serial.println("[BLE] desconectado; monitor Wi-Fi continúa activo");
@@ -1474,6 +1633,7 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t lastRxDiagMs = 0;
   // Reinicia advertising fuera del callback del stack BLE. Esto evita hacer
   // trabajo adicional dentro de onDisconnect() y hace la recuperación más
   // consistente en Arduino-ESP32 3.x.
@@ -1490,7 +1650,24 @@ void loop() {
     bleAdvertisingRestartPending = false;
   }
 
+  if (labRevokeOnBleDisconnect) {
+    labRevokeOnBleDisconnect = false;
+    clearLabAuthorization();
+  }
+
   processPendingCommand();
+  processSerialLabCommand();
+
+  if (monitorRunning && millis() - lastRxDiagMs >= 5000) {
+    lastRxDiagMs = millis();
+    Serial.printf("[RX] data=%lu selected=%lu snap=%lu eapol_type=%lu assoc=%lu bad_state=%lu\n",
+                  static_cast<unsigned long>(rxDiagData),
+                  static_cast<unsigned long>(rxDiagSelected),
+                  static_cast<unsigned long>(rxDiagSnap),
+                  static_cast<unsigned long>(rxDiagEapolType),
+                  static_cast<unsigned long>(rxDiagAssoc),
+                  static_cast<unsigned long>(rxDiagBadState));
+  }
 
   if (monitorRunning && bleConnected && !pcapExportInProgress) {
     static uint32_t lastStatusMs = 0;
